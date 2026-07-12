@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EndpointTrust PKI</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f5f7fb;color:#172033}.hero{background:linear-gradient(135deg,#0f3c81,#1d4ed8);color:white;border-radius:22px;padding:28px;margin:20px 0}.card{border:1px solid #dde7f3;border-radius:18px;box-shadow:0 8px 28px rgba(15,23,42,.06)}.badge-soft{background:#eef5ff;color:#0f3c81}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.status-active,.status-registered,.status-approved{background:#dcfce7;color:#166534}.status-revoked,.status-rejected{background:#fee2e2;color:#991b1b}.status-pending{background:#fef9c3;color:#854d0e}.btn-primary{background:#1d4ed8;border-color:#1d4ed8}.metric{font-size:28px;font-weight:800}.small-muted{font-size:13px;color:#64748b}.section-title{font-weight:800;color:#0f3c81}.pill{border-radius:999px;padding:.25rem .55rem;font-size:.75rem}.codebox{background:#0f172a;color:#dbeafe;border-radius:14px;padding:12px;font-size:12px;white-space:pre-wrap}.table td{vertical-align:middle}.notice{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:16px;padding:14px}
+  </style>
+</head>
+<body>
+<div class="container-fluid px-4">
+  <div class="hero d-flex align-items-center justify-content-between">
+    <div>
+      <h1 class="mb-1">EndpointTrust PKI</h1>
+      <p class="mb-0">Certificate-Based Corporate Laptop Access Verification System</p>
+      <small>Device enrolment is agent-submitted and administrator-approved. Random users cannot self-register as trusted devices.</small>
+    </div>
+    <div class="text-end">
+      <a class="btn btn-light" href="{{ PUBLIC_PREFIX }}/device-portal" target="_blank">Open Device Portal</a>
+      <a class="btn btn-light" href="/internal/">Open Protected HR System</a>
+      <a class="btn btn-outline-light" href="{{ PUBLIC_PREFIX }}/logout">Clear Verified Session</a>
+      <a class="btn btn-outline-light" href="{{ PUBLIC_PREFIX }}/admin/logout">Admin Logout</a>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-md-3"><div class="card p-3"><div class="small-muted">Pending enrolments</div><div class="metric">{{ pending|selectattr('status','equalto','pending')|list|length }}</div></div></div>
+    <div class="col-md-3"><div class="card p-3"><div class="small-muted">Registered devices</div><div class="metric">{{ devices|length }}</div></div></div>
+    <div class="col-md-3"><div class="card p-3"><div class="small-muted">Certificates issued</div><div class="metric">{{ certs|length }}</div></div></div>
+    <div class="col-md-3"><div class="card p-3"><div class="small-muted">Active verified sessions</div><div class="metric">{{ sessions|length }}</div></div></div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <h4 class="section-title">1. Pending Device Enrolment Requests</h4>
+    <p class="small-muted mb-2">Employees submit device metadata and a CSR from the web-based Device Portal (keypair is generated in their browser; the private key never reaches this server). IT approves only if the laptop exists in the company asset inventory. <b>Security tip:</b> before approving, confirm the CSR fingerprint below out-of-band with the employee (e.g. by phone or chat) to rule out enrolment-time tampering.</p>
+    <div class="table-responsive">
+      <table class="table align-middle">
+        <thead><tr><th>Request</th><th>Device identity</th><th>User / department</th><th>CSR fingerprint (verify out-of-band)</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for e in pending %}
+          <tr>
+            <td><b>{{ e.request_id }}</b><br><span class="mono">{{ e.requested_at }}</span></td>
+            <td><b>{{ e.device_id }}</b><br><span class="small-muted">{{ e.hostname }} · {{ e.serial_number }}</span><br><span class="small-muted">MAC: {{ e.mac_address }}</span></td>
+            <td>{{ e.assigned_user }}<br><span class="small-muted">{{ e.department }} · {{ e.os_name }}</span></td>
+            <td class="mono">{{ e.public_key_fingerprint }}</td>
+            <td><span class="badge status-{{ e.status }}">{{ e.status }}</span>{% if e.rejection_reason %}<br><span class="small-muted">{{ e.rejection_reason }}</span>{% endif %}</td>
+            <td>
+              {% if e.status == 'pending' %}
+              <div class="d-flex gap-1 flex-wrap">
+                <form method="post" action="{{ PUBLIC_PREFIX }}/enrollments/approve/{{ e.request_id }}"><button class="btn btn-sm btn-success">Approve & issue certificate</button></form>
+                <form method="post" action="{{ PUBLIC_PREFIX }}/enrollments/reject/{{ e.request_id }}" class="d-flex gap-1"><input class="form-control form-control-sm" name="reason" placeholder="Reject reason"><button class="btn btn-sm btn-outline-danger">Reject</button></form>
+              </div>
+              {% else %}<span class="text-muted">Reviewed</span>{% endif %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="text-center text-muted py-4">No pending enrolment requests. Open the Device Portal from a laptop to submit one.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="notice mt-2"><b>Employee instructions:</b> open <span class="mono">{{ PUBLIC_PREFIX }}/device-portal</span> on the laptop's browser and follow the on-screen steps. (A CLI agent is still available under <span class="mono">scripts/endpointtrust_agent.py</span> for scripted/automated testing.)</div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-lg-8">
+      <div class="card p-3 h-100">
+        <h4 class="section-title">2. Trusted Device Inventory</h4>
+        <div class="table-responsive">
+          <table class="table align-middle">
+            <thead><tr><th>Device</th><th>User</th><th>Status</th><th>Certificate</th><th>Action</th></tr></thead>
+            <tbody>
+            {% for d in devices %}
+              {% set cert = (certs|selectattr('device_id','equalto',d.device_id)|list|first) %}
+              <tr>
+                <td><b>{{ d.device_id }}</b><br><span class="small-muted">{{ d.device_name }}</span><br><span class="small-muted">Serial: {{ d.serial_number }}</span></td>
+                <td>{{ d.assigned_user }}<br><span class="small-muted">{{ d.department }}</span></td>
+                <td><span class="badge status-{{ d.status }}">{{ d.status }}</span></td>
+                <td>{% if cert %}<span class="mono">{{ cert.serial_number[:22] }}...</span><br><a href="{{ PUBLIC_PREFIX }}/download/device/{{ d.device_id }}/cert">download cert</a>{% if cert.private_key_pem %} · <a href="{{ PUBLIC_PREFIX }}/download/device/{{ d.device_id }}/key">demo key</a>{% endif %}{% else %}<span class="text-muted">Not issued</span>{% endif %}</td>
+                <td class="d-flex gap-1 flex-wrap">
+                  {% if cert and cert.private_key_pem %}<form method="post" action="{{ PUBLIC_PREFIX }}/auth/verify-demo/{{ d.device_id }}"><button class="btn btn-sm btn-success">Admin demo verify</button></form>{% endif %}
+                  {% if cert %}<form method="post" action="{{ PUBLIC_PREFIX }}/certificates/revoke/{{ d.device_id }}"><button class="btn btn-sm btn-outline-danger">Revoke</button></form>{% endif %}
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="5" class="text-center text-muted py-4">No trusted laptops yet. Approve a pending enrolment request first.</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-lg-4">
+      <div class="card p-3 h-100">
+        <h4 class="section-title">3. Connecting a Device</h4>
+        <p class="small-muted">Primary path: open <a href="{{ PUBLIC_PREFIX }}/device-portal" target="_blank">the Device Portal</a> in the laptop's browser — it generates the keypair, submits the CSR, fetches the certificate once approved, and proves key ownership, all client-side.</p>
+        <p class="small-muted">Sessions are bound to the source IP at verification time. If a verified session is later seen from a different IP (e.g. a stolen cookie replayed elsewhere), it is automatically revoked and the device must re-verify.</p>
+        <div class="codebox"># legacy CLI agent (still supported for scripted testing)
+python scripts/endpointtrust_agent.py enroll http://localhost:8080/endpointtrust LAP-001 "Finance Laptop" "Nirmal Shrestha" Finance LENOVO-ABC123
+python scripts/endpointtrust_agent.py fetch-cert http://localhost:8080/endpointtrust LAP-001
+python scripts/endpointtrust_agent.py verify http://localhost:8080/endpointtrust LAP-001</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mt-1">
+    <div class="col-lg-6"><div class="card p-3"><h5>Certificate Revocation Database</h5><table class="table table-sm"><thead><tr><th>Serial</th><th>Device</th><th>Reason</th><th>Time</th></tr></thead><tbody>{% for r in revoked %}<tr><td class="mono">{{ r.certificate_serial[:20] }}...</td><td>{{ r.device_id }}</td><td>{{ r.reason }}</td><td class="mono">{{ r.revoked_at }}</td></tr>{% else %}<tr><td colspan="4" class="text-muted text-center">No revoked certificates.</td></tr>{% endfor %}</tbody></table></div></div>
+    <div class="col-lg-6"><div class="card p-3"><h5>Audit Logs</h5><table class="table table-sm"><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>Status</th></tr></thead><tbody>{% for l in logs %}<tr><td class="mono">{{ l.event_time }}</td><td>{{ l.event_type }}</td><td>{{ l.device_id }}</td><td>{{ l.status }}</td></tr>{% else %}<tr><td colspan="4" class="text-muted text-center">No logs yet.</td></tr>{% endfor %}</tbody></table></div></div>
+  </div>
+</div>
+</body>
+</html>
