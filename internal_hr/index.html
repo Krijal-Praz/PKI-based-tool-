@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PeopleHub — HR Portal</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+</head>
+<body>
+
+<!-- LOGIN PAGE -->
+<div id="login-page" class="login-page">
+  <div class="login-card">
+    <div class="login-logo"><i class="ti ti-building-community"></i> PeopleHub</div>
+    <div class="login-title">Welcome back</div>
+    <div class="login-sub">Sign in to your HR portal</div>
+    <div class="form-row">
+      <label class="form-label">Email</label>
+      <input class="form-input" id="login-email" type="email" placeholder="admin@company.com" value="admin@company.com">
+    </div>
+    <div class="form-row">
+      <label class="form-label">Password</label>
+      <input class="form-input" id="login-pass" type="password" placeholder="••••••••" value="password">
+    </div>
+    <button class="btn btn-primary btn-full" onclick="doLogin()">Sign In <i class="ti ti-arrow-right"></i></button>
+    <div class="login-hint">Demo credentials are pre-filled. Just click Sign In.</div>
+  </div>
+</div>
+
+<!-- PORTAL APP -->
+<div id="app" class="portal hidden">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="logo">
+      <i class="ti ti-building-community logo-icon"></i>
+      <div>
+        <div class="logo-text">PeopleHub</div>
+        <div class="logo-sub">HR Management</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-section">Main</div>
+      <div class="nav-item active" data-page="dashboard"><i class="ti ti-layout-dashboard"></i>Dashboard</div>
+      <div class="nav-item" data-page="employees"><i class="ti ti-users"></i>Employees</div>
+      <div class="nav-item" data-page="hrusers"><i class="ti ti-user-check"></i>HR Users<span class="nav-badge" id="badge-hrusers">0</span></div>
+      <div class="nav-item" data-page="activity"><i class="ti ti-clock"></i>Login Activity<span class="nav-badge" id="badge-activity">3</span></div>
+      <div class="nav-section">HR Modules</div>
+      <div class="nav-item" data-page="attendance"><i class="ti ti-calendar-check"></i>Attendance</div>
+      <div class="nav-item" data-page="payroll"><i class="ti ti-cash"></i>Payroll</div>
+      <div class="nav-item" data-page="leaves"><i class="ti ti-beach"></i>Leave Requests<span class="nav-badge" id="badge-leaves">2</span></div>
+      <div class="nav-item" data-page="departments"><i class="ti ti-sitemap"></i>Departments</div>
+      <div class="nav-section">Admin</div>
+      <div class="nav-item" data-page="roles"><i class="ti ti-shield-check"></i>Roles & Access</div>
+      <div class="nav-item" data-page="settings"><i class="ti ti-settings"></i>Settings</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="user-pill">
+        <div class="avatar av-blue">HR</div>
+        <div class="user-info">
+          <p id="admin-name">Admin User</p>
+          <span>HR Manager</span>
+        </div>
+        <button class="icon-btn" onclick="doLogout()" title="Logout"><i class="ti ti-logout"></i></button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <div class="main">
+    <div class="topbar">
+      <div class="page-title" id="page-title">Dashboard</div>
+      <div class="topbar-actions">
+        <div class="search-box">
+          <i class="ti ti-search"></i>
+          <input id="global-search" placeholder="Search employees…" oninput="globalSearch(this.value)">
+        </div>
+        <button class="btn btn-primary" onclick="openModal('add-employee')"><i class="ti ti-plus"></i> Add Employee</button>
+        <button class="icon-btn topbar-notif" title="Notifications"><i class="ti ti-bell"></i><span class="notif-dot"></span></button>
+      </div>
+    </div>
+
+    <div class="content" id="main-content">
+      <!-- Pages rendered by JS -->
+    </div>
+  </div>
+</div>
+
+<!-- MODALS -->
+<div class="modal-backdrop" id="modal-add-employee">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title"><i class="ti ti-user-plus"></i> Add New Employee</div>
+      <button class="icon-btn" onclick="closeModal('add-employee')"><i class="ti ti-x"></i></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row-2">
+        <div class="form-row"><label class="form-label">First Name *</label><input class="form-input" id="new-fname" placeholder="Jane"></div>
+        <div class="form-row"><label class="form-label">Last Name *</label><input class="form-input" id="new-lname" placeholder="Smith"></div>
+      </div>
+      <div class="form-row"><label class="form-label">Email *</label><input class="form-input" id="new-email" type="email" placeholder="jane@company.com"></div>
+      <div class="form-row-2">
+        <div class="form-row"><label class="form-label">Department</label>
+          <select class="form-input" id="new-dept">
+            <option>Engineering</option><option>Marketing</option><option>Finance</option><option>HR</option><option>Sales</option><option>Operations</option>
+          </select>
+        </div>
+        <div class="form-row"><label class="form-label">Job Title</label><input class="form-input" id="new-role" placeholder="Senior Developer"></div>
+      </div>
+      <div class="form-row-2">
+        <div class="form-row"><label class="form-label">Start Date</label><input class="form-input" id="new-date" type="date"></div>
+        <div class="form-row"><label class="form-label">Employment Type</label>
+          <select class="form-input" id="new-type">
+            <option>Full-time</option><option>Part-time</option><option>Contract</option><option>Intern</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row-2">
+        <div class="form-row"><label class="form-label">Phone</label><input class="form-input" id="new-phone" placeholder="+1 555 0100"></div>
+        <div class="form-row"><label class="form-label">Base Salary ($)</label><input class="form-input" id="new-salary" type="number" placeholder="75000"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('add-employee')">Cancel</button>
+      <button class="btn btn-primary" onclick="addEmployee()"><i class="ti ti-check"></i> Add Employee</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-view-emp">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title"><i class="ti ti-id-badge"></i> Employee Profile</div>
+      <button class="icon-btn" onclick="closeModal('view-emp')"><i class="ti ti-x"></i></button>
+    </div>
+    <div class="modal-body" id="emp-profile-body"></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('view-emp')">Close</button>
+      <button class="btn btn-primary" onclick="showToast('Edit mode coming soon')"><i class="ti ti-edit"></i> Edit</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-confirm">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <div class="modal-title"><i class="ti ti-alert-triangle" style="color:var(--danger)"></i> Confirm Action</div>
+      <button class="icon-btn" onclick="closeModal('confirm')"><i class="ti ti-x"></i></button>
+    </div>
+    <div class="modal-body"><p id="confirm-msg" style="font-size:14px;color:var(--text-secondary)">Are you sure?</p></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('confirm')">Cancel</button>
+      <button class="btn btn-danger" id="confirm-ok">Yes, Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast">
+  <i class="ti ti-check toast-icon"></i>
+  <span id="toast-msg"></span>
+</div>
+
+<script src="js/data.js"></script>
+<script src="js/app.js"></script>
+<script src="js/pages.js"></script>
+</body>
+</html>
