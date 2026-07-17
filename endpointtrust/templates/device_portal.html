@@ -16,7 +16,7 @@
   .codebox{background:#0f172a;color:#dbeafe;border-radius:14px;padding:12px;font-size:12px;white-space:pre-wrap;max-height:160px;overflow:auto}
   .status-pill{border-radius:999px;padding:.3rem .7rem;font-size:.8rem;font-weight:700}
   .status-pending{background:#fef9c3;color:#854d0e}
-  .status-approved,.status-active,.status-allowed{background:#dcfce7;color:#166534}
+  .status-approved,.status-active,.status-allowed,.status-already_certified{background:#dcfce7;color:#166534}
   .status-rejected,.status-revoked,.status-denied{background:#fee2e2;color:#991b1b}
   .btn-primary{background:#1d4ed8;border-color:#1d4ed8}
   .small-muted{font-size:13px;color:#64748b}
@@ -28,6 +28,10 @@
     <h2 class="mb-1">EndpointTrust Device Portal</h2>
     <p class="mb-0">Enrol this laptop and connect to the internal HR system — entirely in the browser.</p>
     <small>Your private key is generated here and never leaves this device.</small>
+  </div>
+
+  <div id="sessionBanner" class="alert alert-secondary border mb-3">
+    <b>Device access state:</b> Checking this browser session…
   </div>
 
   <div class="card p-4 mb-3">
@@ -47,7 +51,7 @@
       <div class="col-md-6"><input class="form-control" id="assigned_user" placeholder="Your name"></div>
       <div class="col-md-6"><input class="form-control" id="department" placeholder="Department e.g. Marketing"></div>
     </div>
-    <button class="btn btn-primary mt-3" onclick="generateAndEnroll()">Generate keypair &amp; Enrol</button>
+    <button class="btn btn-primary mt-3" id="enrollButton" onclick="generateAndEnroll()">Generate keypair &amp; Enrol</button>
     <div id="enrollResult" class="mt-2"></div>
   </div>
 
@@ -119,10 +123,47 @@ function initAutoDetect(){
 initAutoDetect();
 
 function getState(){
-  try { return JSON.parse(localStorage.getItem('endpointtrust_device') || '{}'); }
+  try { return JSON.parse(localStorage.getItem('endpointtrust_device_v5') || '{}'); }
   catch(e){ return {}; }
 }
-function setState(s){ localStorage.setItem('endpointtrust_device', JSON.stringify(s)); renderState(); }
+function setState(s){ localStorage.setItem('endpointtrust_device_v5', JSON.stringify(s)); renderState(); }
+
+function privateKeyMatchesCertificate(privateKeyPem, certificatePem){
+  try {
+    const probe = "EndpointTrust-key-match-" + Date.now() + "-" + Math.random();
+    const signer = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
+    signer.init(privateKeyPem);
+    signer.updateString(probe);
+    const signatureHex = signer.sign();
+
+    const certificate = new X509();
+    certificate.readCertPEM(certificatePem);
+    const verifier = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
+    verifier.init(certificate.getPublicKey());
+    verifier.updateString(probe);
+    return verifier.verify(signatureHex);
+  } catch (e) {
+    console.error("Key/certificate match test failed", e);
+    return false;
+  }
+}
+
+async function checkCurrentSession(){
+  const banner = document.getElementById('sessionBanner');
+  try {
+    const response = await fetch(API + "/api/auth/session-status", {credentials: "same-origin", cache: "no-store"});
+    const data = await response.json();
+    if (response.ok && data.active){
+      banner.className = "alert alert-success border mb-3";
+      banner.innerHTML = `<b>HR access active</b> — verified device <span class="mono">${data.device_id}</span>. Session expires ${data.expires_at}. <a href="/internal/" class="alert-link">Open HR portal</a>`;
+      document.getElementById('s4').classList.add('done');
+      return true;
+    }
+  } catch(e) {}
+  banner.className = "alert alert-warning border mb-3";
+  banner.innerHTML = '<b>HR access inactive</b> — certificate approval alone does not create a session. Complete Step 4 to prove ownership of the matching private key.';
+  return false;
+}
 function renderState(){
   const s = getState();
   document.getElementById('localState').textContent = JSON.stringify({
@@ -132,16 +173,18 @@ function renderState(){
   }, null, 2);
   if (s.private_key_pem) document.getElementById('s1').classList.add('done');
   if (s.certificate_pem) { document.getElementById('s2').classList.add('done'); document.getElementById('s3').classList.add('done'); }
+  if (s.verified_at) document.getElementById('s4').classList.add('done');
 }
-function resetLocal(){ localStorage.removeItem('endpointtrust_device'); renderState();
+checkCurrentSession();
+function resetLocal(){ localStorage.removeItem('endpointtrust_device_v5'); localStorage.removeItem('endpointtrust_device'); renderState();
   document.getElementById('enrollResult').innerHTML='';document.getElementById('statusResult').innerHTML='';
   document.getElementById('certResult').innerHTML='';document.getElementById('verifyResult').innerHTML='';
 }
 renderState();
+checkStoredDeviceCertification();
 
 async function generateAndEnroll(){
   const out = document.getElementById('enrollResult');
-  out.innerHTML = '<span class="small-muted">Generating 2048-bit RSA keypair in your browser...</span>';
   const device_id = document.getElementById('device_id').value.trim().toUpperCase();
   const fields = {
     device_id,
@@ -157,10 +200,22 @@ async function generateAndEnroll(){
     out.innerHTML = '<div class="alert alert-warning">Please fill in Device ID, device name, your name and department.</div>';
     return;
   }
+
+  out.innerHTML = '<span class="small-muted">Checking whether this device is already certified...</span>';
   try {
-    // 1. Reuse the existing device private key when enrolment is retried.
-    // Generating a new key for an already-pending/approved device would make
-    // the locally stored key differ from the public key in the issued certificate.
+    // Check the entered device ID before generating or replacing any local key.
+    const statusResp = await fetch(API + "/api/enrollment/status/" + encodeURIComponent(device_id), {cache: "no-store"});
+    const statusData = await statusResp.json();
+    if (statusData.certificate && statusData.certificate.status === "active"){
+      showAlreadyCertified({
+        device_id,
+        certificate_serial: statusData.certificate.serial_number,
+        expires_at: statusData.certificate.expires_at
+      }, out);
+      return;
+    }
+
+    out.innerHTML = '<span class="small-muted">Generating 2048-bit RSA keypair in your browser...</span>';
     const existing = getState();
     let privPem, pubPem;
     if (existing.device_id === device_id && existing.private_key_pem) {
@@ -173,7 +228,6 @@ async function generateAndEnroll(){
       pubPem = KEYUTIL.getPEM(kp.pubKeyObj);
     }
 
-    // 2. Build a PKCS#10 CSR signed with that private key
     const csrPem = KJUR.asn1.csr.CSRUtil.newCSRPEM({
       subject: { str: "/CN=" + device_id + "/O=EndpointTrust-Device" },
       sbjpubkey: pubPem,
@@ -181,23 +235,59 @@ async function generateAndEnroll(){
       sbjprvkey: privPem,
     });
 
-    setState({ device_id, private_key_pem: privPem });
-
-    // 3. Submit only the CSR + metadata to the server
     const resp = await fetch(API + "/api/enrollment/request", {
       method: "POST", headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ ...fields, csr: csrPem })
     });
     const data = await resp.json();
-    if (resp.ok || resp.status === 409){
-      const extra = resp.status === 409 ? '<br><b>Existing private key retained.</b> Do not reset browser storage while approval is pending.' : '';
-      out.innerHTML = `<div class="alert alert-info">Status: <span class="status-pill status-${data.status}">${data.status}</span><br>${data.message || ''}${extra}</div>`;
+
+    if (resp.status === 409 && data.status === "already_certified"){
+      // Do not overwrite the browser's existing private key when registration is blocked.
+      showAlreadyCertified(data, out);
+      return;
+    }
+    if (resp.ok){
+      // Store the private key only after the server accepts the enrolment request.
+      setState({
+        ...existing,
+        ...fields,
+        device_id,
+        private_key_pem: privPem,
+        certificate_pem: existing.device_id === device_id ? existing.certificate_pem : null,
+        certificate_serial: existing.device_id === device_id ? existing.certificate_serial : null,
+        verified_at: null
+      });
+      out.innerHTML = `<div class="alert alert-info">Status: <span class="status-pill status-${data.status}">${data.status}</span><br>${data.message || ''}<br><b>Keep this browser data until the certificate is fetched and verified.</b></div>`;
     } else {
       out.innerHTML = `<div class="alert alert-danger">${data.message || 'Enrolment failed'}</div>`;
     }
   } catch(e){
     out.innerHTML = `<div class="alert alert-danger">Error: ${e.message}</div>`;
   }
+}
+
+function showAlreadyCertified(data, target){
+  target.innerHTML = `<div class="alert alert-success"><b>This device is already certified.</b><br>${data.message || 'It already has an active EndpointTrust certificate, so another registration is blocked.'}<br>Registered Device ID: <span class="mono">${data.device_id || ''}</span>${data.certificate_serial ? `<br>Certificate serial: <span class="mono">${data.certificate_serial}</span>` : ''}${data.expires_at ? `<br>Expires: ${data.expires_at}` : ''}<br><b>Use the existing certificate or contact IT support if recovery is required.</b></div>`;
+}
+
+async function checkStoredDeviceCertification(){
+  const s = getState();
+  if (!s.device_id) return;
+  document.getElementById('device_id').value = s.device_id;
+  try {
+    const resp = await fetch(API + "/api/enrollment/status/" + encodeURIComponent(s.device_id), {cache: "no-store"});
+    const data = await resp.json();
+    if (data.certificate && data.certificate.status === "active"){
+      showAlreadyCertified({
+        device_id: s.device_id,
+        certificate_serial: data.certificate.serial_number,
+        expires_at: data.certificate.expires_at
+      }, document.getElementById('enrollResult'));
+      document.getElementById('s1').classList.add('done');
+      document.getElementById('s2').classList.add('done');
+      document.getElementById('s3').classList.add('done');
+    }
+  } catch(e) {}
 }
 
 async function checkStatus(){
@@ -218,8 +308,12 @@ async function fetchCertificate(){
   const resp = await fetch(API + "/api/certificates/device/" + s.device_id);
   const data = await resp.json();
   if (resp.ok){
-    setState({ ...s, certificate_pem: data.certificate_pem, certificate_serial: data.serial_number });
-    out.innerHTML = `<div class="alert alert-success">Certificate fetched. Serial: <span class="mono">${data.serial_number}</span></div>`;
+    if (!s.private_key_pem || !privateKeyMatchesCertificate(s.private_key_pem, data.certificate_pem)){
+      out.innerHTML = `<div class="alert alert-danger"><b>Certificate/private-key mismatch detected.</b><br>This certificate does not match the private key stored in this browser. Registration is locked because the device is already certified. Contact IT support to revoke the old certificate and reset the device before enrolling again.</div>`;
+      return;
+    }
+    setState({ ...s, certificate_pem: data.certificate_pem, certificate_serial: data.serial_number, verified_at: null });
+    out.innerHTML = `<div class="alert alert-success"><b>Certificate fetched and matched to this browser private key.</b><br>Serial: <span class="mono">${data.serial_number}</span></div>`;
   } else {
     out.innerHTML = `<div class="alert alert-warning">${data.message || 'Certificate not available yet'}</div>`;
   }
@@ -232,10 +326,14 @@ async function verifyAndConnect(){
     out.innerHTML = '<div class="alert alert-warning">Generate a key and fetch your certificate first.</div>';
     return;
   }
+  if (!privateKeyMatchesCertificate(s.private_key_pem, s.certificate_pem)){
+    out.innerHTML = '<div class="alert alert-danger"><b>Verification stopped:</b> the stored certificate does not match this browser private key. Contact IT support to revoke and reset the existing device certificate before attempting a new enrolment.</div>';
+    return;
+  }
   try {
     // 1. Request a fresh single-use challenge nonce
     const chResp = await fetch(API + "/api/auth/challenge", {
-      method: "POST", headers: {"Content-Type":"application/json"},
+      method: "POST", headers: {"Content-Type":"application/json"}, credentials: "same-origin", cache: "no-store",
       body: JSON.stringify({ device_id: s.device_id })
     });
     const ch = await chResp.json();
@@ -250,7 +348,7 @@ async function verifyAndConnect(){
 
     // 3. Send proof back to the server for verification against the certificate
     const vResp = await fetch(API + "/api/auth/verify", {
-      method: "POST", headers: {"Content-Type":"application/json"},
+      method: "POST", headers: {"Content-Type":"application/json"}, credentials: "same-origin", cache: "no-store",
       body: JSON.stringify({
         device_id: s.device_id, challenge_id: ch.challenge_id,
         signature: sigB64, certificate_pem: s.certificate_pem
@@ -258,8 +356,14 @@ async function verifyAndConnect(){
     });
     const v = await vResp.json();
     if (vResp.ok && v.status === "allowed"){
-      out.innerHTML = `<div class="alert alert-success">Verified! Redirecting to HR system…</div>`;
-      window.location.href = v.session_url;
+      const active = await checkCurrentSession();
+      if (!active){
+        out.innerHTML = '<div class="alert alert-danger">The signature was accepted, but the browser did not retain the trusted-device session cookie. Reload this page and try Step 4 again.</div>';
+        return;
+      }
+      setState({ ...s, verified_at: new Date().toISOString() });
+      out.innerHTML = `<div class="alert alert-success"><b>Device verified.</b> Active session created and HR access unlocked. Redirecting…</div>`;
+      setTimeout(() => { window.location.href = v.internal_url || "/internal/"; }, 700);
     } else {
       out.innerHTML = `<div class="alert alert-danger">${v.message || 'Verification failed'}</div>`;
     }

@@ -20,6 +20,7 @@ from cryptography.x509.oid import NameOID
 def endpointtrust(tmp_path, monkeypatch):
     monkeypatch.setenv("ENDPOINTTRUST_DB", str(tmp_path / "endpointtrust.db"))
     monkeypatch.setenv("ENDPOINTTRUST_CERT_DIR", str(tmp_path / "certs"))
+    monkeypatch.setenv("ENDPOINTTRUST_SECURE_STORAGE", str(tmp_path / "secure_storage"))
     monkeypatch.setenv("ENDPOINTTRUST_PUBLIC_PREFIX", "/endpointtrust")
     monkeypatch.setenv("ENDPOINTTRUST_REBIND_IP", "true")
     module_path = Path(__file__).parents[1] / "endpointtrust" / "app.py"
@@ -148,40 +149,38 @@ def test_complete_trusted_endpoint_workflow(endpointtrust):
     assert client.get("/auth/nginx-check", headers={"X-Real-IP": "127.0.0.1"}).status_code == 403
 
 
-def test_reenrollment_replaces_old_certificate_and_session(endpointtrust):
+def test_duplicate_enrollment_is_blocked_for_certified_device(endpointtrust):
     client = endpointtrust.app.test_client()
     admin_auth = ("admin", "EndpointTrust@123")
 
-    old_key, old_csr = make_identity()
-    old_request = enrol(client, old_csr).get_json()["request_id"]
-    client.post(f"/api/admin/enrollments/approve/{old_request}", auth=admin_auth)
-    old_cert = client.get("/api/certificates/device/LAP-HR-001").get_json()
-    assert verify_device(client, old_key, old_cert["certificate_pem"]).status_code == 200
+    key, csr_pem = make_identity()
+    request_id = enrol(client, csr_pem).get_json()["request_id"]
+    assert client.post(f"/api/admin/enrollments/approve/{request_id}", auth=admin_auth).status_code == 200
 
-    # Browser storage loss can be recovered by submitting a fresh CSR for the same device.
-    new_key, new_csr = make_identity()
-    reenrol = enrol(client, new_csr)
-    assert reenrol.status_code == 200
-    assert "Re-enrollment" in reenrol.get_json()["message"]
-    new_request = reenrol.get_json()["request_id"]
-    assert client.post(f"/api/admin/enrollments/approve/{new_request}", auth=admin_auth).status_code == 200
+    certificate = client.get("/api/certificates/device/LAP-HR-001").get_json()
+    assert verify_device(client, key, certificate["certificate_pem"]).status_code == 200
 
-    new_cert = client.get("/api/certificates/device/LAP-HR-001").get_json()
-    assert new_cert["serial_number"] != old_cert["serial_number"]
+    # A second CSR for the same registered device must be rejected.
+    _new_key, new_csr = make_identity()
+    duplicate = enrol(client, new_csr)
+    assert duplicate.status_code == 409
+    body = duplicate.get_json()
+    assert body["status"] == "already_certified"
+    assert body["device_id"] == "LAP-HR-001"
+    assert body["certificate_serial"] == certificate["serial_number"]
+
+    # Changing only the device ID must not bypass the hardware/asset check.
+    _other_key, other_csr = make_identity(device_id="LAP-HR-999")
+    duplicate_alias = enrol(client, other_csr, device_id="LAP-HR-999")
+    assert duplicate_alias.status_code == 409
+    assert duplicate_alias.get_json()["device_id"] == "LAP-HR-001"
 
     dashboard = client.get("/api/admin/dashboard", auth=admin_auth).get_json()
-    assert dashboard["sessions"] == []  # old session was terminated on replacement
-    cert_statuses = {row["serial_number"]: row["status"] for row in dashboard["certificates"]}
-    assert cert_statuses[old_cert["serial_number"]] == "superseded"
-    assert cert_statuses[new_cert["serial_number"]] == "active"
-
-    # Old key cannot authenticate against the new active certificate.
-    old_attempt = verify_device(client, old_key, new_cert["certificate_pem"])
-    assert old_attempt.status_code == 403
-
-    # New key/certificate pair succeeds and creates a fresh session.
-    new_attempt = verify_device(client, new_key, new_cert["certificate_pem"])
-    assert new_attempt.status_code == 200
+    assert dashboard["pending"] == []
+    assert len(dashboard["devices"]) == 1
+    assert len([c for c in dashboard["certificates"] if c["status"] == "active"]) == 1
+    assert any(log["event_type"] == "DUPLICATE_ENROLLMENT_BLOCKED" for log in dashboard["logs"])
+    assert all(log.get("incident_time") for log in dashboard["logs"])
 
 
 def test_wrong_private_key_is_denied(endpointtrust):
@@ -206,3 +205,46 @@ def test_admin_api_rejects_invalid_credentials(endpointtrust):
     client = endpointtrust.app.test_client()
     response = client.get("/api/admin/dashboard", auth=("admin", "wrong-password"))
     assert response.status_code == 401
+
+
+def test_sensitive_data_is_encrypted_at_rest(endpointtrust):
+    client = endpointtrust.app.test_client()
+    admin_auth = ("admin", "EndpointTrust@123")
+    key, csr_pem = make_identity()
+    request = enrol(client, csr_pem, user="Sensitive Employee")
+    assert request.status_code == 200
+    request_id = request.get_json()["request_id"]
+
+    with endpointtrust.db() as conn:
+        pending = conn.execute("SELECT * FROM pending_enrollments WHERE request_id=?", (request_id,)).fetchone()
+    assert pending["assigned_user"].startswith("enc:v1:")
+    assert pending["serial_number"].startswith("enc:v1:")
+    assert pending["hostname"].startswith("enc:v1:")
+    assert pending["mac_address"].startswith("enc:v1:")
+    assert pending["csr_pem"].startswith("file:v1:")
+    csr_files = list((endpointtrust.SECURE_STORAGE_DIR / "encrypted_csrs").glob("*.csr.enc"))
+    assert len(csr_files) == 1
+    assert b"BEGIN CERTIFICATE REQUEST" not in csr_files[0].read_bytes()
+
+    assert client.post(f"/api/admin/enrollments/approve/{request_id}", auth=admin_auth).status_code == 200
+    certificate = client.get("/api/certificates/device/LAP-HR-001").get_json()
+    verification = verify_device(client, key, certificate["certificate_pem"])
+    assert verification.status_code == 200
+    raw_token = verification.headers["Set-Cookie"].split("endpointtrust_session=", 1)[1].split(";", 1)[0]
+
+    with endpointtrust.db() as conn:
+        device = conn.execute("SELECT * FROM devices WHERE device_id='LAP-HR-001'").fetchone()
+        stored_session = conn.execute("SELECT * FROM sessions WHERE device_id='LAP-HR-001'").fetchone()
+        stored_log = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert device["assigned_user"].startswith("enc:v1:")
+    assert device["serial_number"].startswith("enc:v1:")
+    assert raw_token not in stored_session["token"]
+    assert raw_token not in stored_session["token_encrypted"]
+    assert stored_session["token_encrypted"].startswith("enc:v1:")
+    assert stored_log["detail"].startswith("enc:v1:")
+    assert stored_log["source_ip"].startswith("enc:v1:")
+    assert list((endpointtrust.SECURE_STORAGE_DIR / "encrypted_logs").glob("audit-*.log.enc"))
+
+    dashboard = client.get("/api/admin/dashboard", auth=admin_auth).get_json()
+    assert dashboard["devices"][0]["assigned_user"] == "Sensitive Employee"
+    assert dashboard["logs"][0]["detail"]

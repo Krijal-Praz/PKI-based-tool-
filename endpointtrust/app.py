@@ -2,7 +2,9 @@ import base64
 import os
 import secrets
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import wraps
 
@@ -14,10 +16,17 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from werkzeug.security import check_password_hash, generate_password_hash
 
 APP_ROOT = Path(__file__).resolve().parent
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+from crypto_service import SecureStorage
+
 DB_PATH = Path(os.environ.get("ENDPOINTTRUST_DB", APP_ROOT / "data" / "endpointtrust.db"))
 CERT_DIR = Path(os.environ.get("ENDPOINTTRUST_CERT_DIR", APP_ROOT / "certs"))
+SECURE_STORAGE_DIR = Path(os.environ.get("ENDPOINTTRUST_SECURE_STORAGE", APP_ROOT / "secure_storage"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 CERT_DIR.mkdir(parents=True, exist_ok=True)
+SECURE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+secure_storage = SecureStorage(SECURE_STORAGE_DIR)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("ENDPOINTTRUST_SECRET", secrets.token_hex(32))
@@ -91,13 +100,68 @@ def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def incident_time_display(value):
+    """Return an audit timestamp in Nepal local time for human-readable dashboards."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        local = parsed.astimezone(ZoneInfo("Asia/Kathmandu"))
+        return local.strftime("%Y-%m-%d %H:%M:%S NPT")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def client_ip():
+    """Return the original browser IP consistently through Nginx and Flask."""
+    real_ip = (request.headers.get("X-Real-IP") or "").strip()
+    if real_ip:
+        return real_ip
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return (request.remote_addr or "unknown").strip()
+
+
+def protect(value, purpose):
+    return secure_storage.encrypt_text(str(value), purpose)
+
+
+def reveal(value, purpose):
+    return secure_storage.decrypt_text(str(value), purpose)
+
+
+def decrypt_record(row):
+    item = dict(row)
+    field_purposes = {
+        "assigned_user": "assigned_user",
+        "serial_number": "device_serial",
+        "hostname": "hostname",
+        "mac_address": "mac_address",
+        "detail": "audit_detail",
+        "source_ip": "audit_source_ip",
+    }
+    for field, purpose in field_purposes.items():
+        if field in item:
+            item[field] = reveal(item[field], purpose)
+    return item
+
+
 def log_event(event_type, device_id="-", status="INFO", detail=""):
+    event_time = now_iso()
+    source_ip = client_ip()
+    encrypted_detail = protect(detail, "audit_detail")
+    encrypted_source_ip = protect(source_ip, "audit_source_ip")
     with db() as conn:
         conn.execute(
             "INSERT INTO audit_logs(event_time,event_type,device_id,status,detail,source_ip) VALUES(?,?,?,?,?,?)",
-            (now_iso(), event_type, device_id, status, detail, request.headers.get("X-Real-IP", request.remote_addr or "-")),
+            (event_time, event_type, device_id, status, encrypted_detail, encrypted_source_ip),
         )
         conn.commit()
+    secure_storage.append_encrypted_log({
+        "event_time": event_time, "event_type": event_type, "device_id": device_id,
+        "status": status, "detail": detail, "source_ip": source_ip,
+    }, event_time[:10])
 
 
 def init_db():
@@ -111,6 +175,7 @@ def init_db():
                 assigned_user TEXT NOT NULL,
                 department TEXT NOT NULL,
                 serial_number TEXT NOT NULL,
+                serial_lookup TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL
             );
@@ -125,6 +190,8 @@ def init_db():
                 hostname TEXT NOT NULL,
                 os_name TEXT NOT NULL,
                 mac_address TEXT NOT NULL,
+                serial_lookup TEXT NOT NULL DEFAULT '',
+                mac_lookup TEXT NOT NULL DEFAULT '',
                 csr_pem TEXT NOT NULL,
                 public_key_fingerprint TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -162,7 +229,9 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS sessions(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                token TEXT UNIQUE NOT NULL,
+                token TEXT NOT NULL DEFAULT '',
+                token_hash TEXT UNIQUE NOT NULL DEFAULT '',
+                token_encrypted TEXT NOT NULL DEFAULT '',
                 device_id TEXT NOT NULL,
                 certificate_serial TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -181,10 +250,40 @@ def init_db():
             );
             """
         )
-        try:
-            conn.execute("ALTER TABLE sessions ADD COLUMN bound_ip TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
+        migrations = [
+            "ALTER TABLE sessions ADD COLUMN bound_ip TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN token_hash TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN token_encrypted TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN serial_lookup TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pending_enrollments ADD COLUMN serial_lookup TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pending_enrollments ADD COLUMN mac_lookup TEXT NOT NULL DEFAULT ''",
+        ]
+        for statement in migrations:
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash) WHERE token_hash <> ''")
+        # Upgrade older v5/v6 databases without losing records.
+        for row in conn.execute("SELECT id, serial_number, serial_lookup FROM devices").fetchall():
+            if not row["serial_lookup"]:
+                plain_serial = reveal(row["serial_number"], "device_serial")
+                conn.execute("UPDATE devices SET serial_number=?, serial_lookup=? WHERE id=?",
+                             (protect(plain_serial, "device_serial"), secure_storage.lookup_hash(plain_serial, "serial"), row["id"]))
+        for row in conn.execute("SELECT id, assigned_user, serial_number, hostname, mac_address, serial_lookup, mac_lookup FROM pending_enrollments").fetchall():
+            plain_user = reveal(row["assigned_user"], "assigned_user")
+            plain_serial = reveal(row["serial_number"], "device_serial")
+            plain_host = reveal(row["hostname"], "hostname")
+            plain_mac = reveal(row["mac_address"], "mac_address")
+            conn.execute("""UPDATE pending_enrollments SET assigned_user=?, serial_number=?, hostname=?, mac_address=?, serial_lookup=?, mac_lookup=? WHERE id=?""",
+                         (protect(plain_user, "assigned_user"), protect(plain_serial, "device_serial"), protect(plain_host, "hostname"), protect(plain_mac, "mac_address"),
+                          row["serial_lookup"] or secure_storage.lookup_hash(plain_serial, "serial"),
+                          row["mac_lookup"] or secure_storage.lookup_hash(plain_mac, "mac"), row["id"]))
+        for row in conn.execute("SELECT id, token, token_hash, token_encrypted FROM sessions").fetchall():
+            if not row["token_hash"] and row["token"]:
+                token_hash = secure_storage.token_hash(row["token"])
+                conn.execute("UPDATE sessions SET token=?, token_hash=?, token_encrypted=? WHERE id=?",
+                             (token_hash, token_hash, protect(row["token"], "session_token"), row["id"]))
         conn.commit()
 
 
@@ -228,11 +327,20 @@ def load_ca():
     return key, cert
 
 
-def public_key_fingerprint_from_csr(csr):
-    pub = csr.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+def public_key_fingerprint(public_key):
+    pub = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
     h = hashes.Hash(hashes.SHA256())
     h.update(pub)
     return h.finalize().hex()
+
+
+def public_key_fingerprint_from_csr(csr):
+    return public_key_fingerprint(csr.public_key())
+
+
+def public_key_fingerprint_from_certificate(certificate_pem):
+    cert = x509.load_pem_x509_certificate(certificate_pem.encode())
+    return public_key_fingerprint(cert.public_key())
 
 
 def sign_csr_device_certificate(device, csr_pem):
@@ -329,7 +437,8 @@ def valid_session(token, client_ip=None):
     if not token:
         return None
     with db() as conn:
-        row = conn.execute("SELECT * FROM sessions WHERE token=? AND active=1", (token,)).fetchone()
+        token_hash = secure_storage.token_hash(token)
+        row = conn.execute("SELECT * FROM sessions WHERE token_hash=? AND active=1", (token_hash,)).fetchone()
         if not row:
             return None
         if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
@@ -338,7 +447,7 @@ def valid_session(token, client_ip=None):
             # Risk-based re-verification: the network location changed mid-session
             # (possible session hijack / stolen cookie). Kill the session instead
             # of trusting it, and force the device to re-run challenge-response.
-            conn.execute("UPDATE sessions SET active=0 WHERE token=?", (token,))
+            conn.execute("UPDATE sessions SET active=0 WHERE token_hash=?", (token_hash,))
             conn.commit()
             log_event("SESSION_IP_MISMATCH", row["device_id"], "DENIED",
                       f"Session bound to {row['bound_ip']} but request came from {client_ip}; session revoked, re-verification required")
@@ -390,42 +499,68 @@ def device_portal():
 @admin_required
 def dashboard():
     with db() as conn:
-        pending = conn.execute("SELECT * FROM pending_enrollments ORDER BY id DESC").fetchall()
-        devices = conn.execute("SELECT * FROM devices ORDER BY id DESC").fetchall()
+        conn.execute("UPDATE sessions SET active=0 WHERE active=1 AND expires_at<=?", (now_iso(),))
+        pending = [decrypt_record(r) for r in conn.execute("SELECT * FROM pending_enrollments WHERE status='pending' ORDER BY id DESC").fetchall()]
+        devices = [decrypt_record(r) for r in conn.execute("SELECT * FROM devices ORDER BY id DESC").fetchall()]
         certs = conn.execute("SELECT * FROM certificates ORDER BY id DESC").fetchall()
         revoked = conn.execute("SELECT * FROM revoked_certificates ORDER BY id DESC").fetchall()
-        logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 80").fetchall()
-        sessions = conn.execute("SELECT * FROM sessions WHERE active=1 ORDER BY id DESC").fetchall()
+        logs = [decrypt_record(r) for r in conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 80").fetchall()]
+        for log in logs:
+            log["incident_time"] = incident_time_display(log.get("event_time"))
+        sessions = conn.execute("SELECT * FROM sessions WHERE active=1 AND expires_at>? ORDER BY id DESC", (now_iso(),)).fetchall()
+        conn.commit()
     return render_template("dashboard.html", pending=pending, devices=devices, certs=certs, revoked=revoked, logs=logs, sessions=sessions)
+
+
+def approve_enrollment_request(request_id, reviewed_by):
+    """Approve exactly one pending CSR and make its certificate the active device identity.
+
+    A new approval always issues a certificate for the CSR being reviewed. Any older
+    active certificate for the same device becomes superseded and its sessions are
+    terminated, preventing a stale certificate/private-key pair from remaining trusted.
+    """
+    with db() as conn:
+        enr = conn.execute("SELECT * FROM pending_enrollments WHERE request_id=?", (request_id,)).fetchone()
+        if not enr or enr["status"] != "pending":
+            return None
+
+        plain_enr = decrypt_record(enr)
+        conn.execute(
+            """INSERT INTO devices(device_id,device_name,assigned_user,department,serial_number,serial_lookup,status,created_at)
+               VALUES(?,?,?,?,?,?,'registered',?)
+               ON CONFLICT(device_id) DO UPDATE SET
+                 device_name=excluded.device_name,
+                 assigned_user=excluded.assigned_user,
+                 department=excluded.department,
+                 serial_number=excluded.serial_number,
+                 serial_lookup=excluded.serial_lookup,
+                 status='registered'""",
+            (enr["device_id"], enr["device_name"], enr["assigned_user"], enr["department"], enr["serial_number"], enr["serial_lookup"], now_iso()),
+        )
+
+        # A fresh approved CSR becomes the only active certificate for the device.
+        conn.execute("UPDATE certificates SET status='superseded' WHERE device_id=? AND status='active'", (enr["device_id"],))
+        conn.execute("UPDATE sessions SET active=0 WHERE device_id=?", (enr["device_id"],))
+        csr_pem = secure_storage.load_csr(enr["csr_pem"], enr["request_id"])
+        serial, subject, issued, expires, cert_pem = sign_csr_device_certificate(plain_enr, csr_pem)
+        conn.execute(
+            "INSERT INTO certificates(device_id,serial_number,subject,issued_at,expires_at,certificate_pem,private_key_pem,status) VALUES(?,?,?,?,?,?,?,?)",
+            (enr["device_id"], serial, subject, issued, expires, cert_pem, "", "active"),
+        )
+        conn.execute(
+            "UPDATE pending_enrollments SET status='approved', reviewed_at=?, reviewed_by=? WHERE request_id=?",
+            (now_iso(), reviewed_by, request_id),
+        )
+        conn.commit()
+    return {"device_id": enr["device_id"], "certificate_serial": serial}
 
 
 @app.post("/enrollments/approve/<request_id>")
 @admin_required
 def approve_enrollment(request_id):
-    with db() as conn:
-        enr = conn.execute("SELECT * FROM pending_enrollments WHERE request_id=?", (request_id,)).fetchone()
-        if not enr or enr["status"] != "pending":
-            return redirect(public_url("/"))
-        existing_device = conn.execute("SELECT * FROM devices WHERE device_id=?", (enr["device_id"],)).fetchone()
-        existing_cert = conn.execute("SELECT * FROM certificates WHERE device_id=? AND status='active'", (enr["device_id"],)).fetchone()
-        if not existing_device:
-            conn.execute(
-                "INSERT INTO devices(device_id,device_name,assigned_user,department,serial_number,status,created_at) VALUES(?,?,?,?,?,?,?)",
-                (enr["device_id"], enr["device_name"], enr["assigned_user"], enr["department"], enr["serial_number"], "registered", now_iso()),
-            )
-        else:
-            # Re-enrollment: reset revoked/suspended device back to registered
-            conn.execute("UPDATE devices SET status='registered', device_name=?, assigned_user=?, department=? WHERE device_id=?",
-                         (enr["device_name"], enr["assigned_user"], enr["department"], enr["device_id"]))
-        if not existing_cert:
-            serial, subject, issued, expires, cert_pem = sign_csr_device_certificate(enr, enr["csr_pem"])
-            conn.execute(
-                "INSERT INTO certificates(device_id,serial_number,subject,issued_at,expires_at,certificate_pem,private_key_pem,status) VALUES(?,?,?,?,?,?,?,?)",
-                (enr["device_id"], serial, subject, issued, expires, cert_pem, "", "active"),
-            )
-        conn.execute("UPDATE pending_enrollments SET status='approved', reviewed_at=?, reviewed_by=? WHERE request_id=?", (now_iso(), "it_admin", request_id))
-        conn.commit()
-    log_event("ENROLLMENT_APPROVED", enr["device_id"], "SUCCESS", "CSR signed and device certificate issued")
+    result = approve_enrollment_request(request_id, "it_admin")
+    if result:
+        log_event("ENROLLMENT_APPROVED", result["device_id"], "SUCCESS", f"CSR signed; certificate {result['certificate_serial']} issued")
     return redirect(public_url("/"))
 
 
@@ -454,8 +589,8 @@ def register_device():
     serial = request.form.get("serial_number", "LENOVO-DEMO-001").strip().upper()
     with db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO devices(device_id,device_name,assigned_user,department,serial_number,status,created_at) VALUES(?,?,?,?,?,?,?)",
-            (device_id, name, user, dept, serial, "registered", now_iso()),
+            "INSERT OR IGNORE INTO devices(device_id,device_name,assigned_user,department,serial_number,serial_lookup,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (device_id, name, protect(user, "assigned_user"), dept, protect(serial, "device_serial"), secure_storage.lookup_hash(serial, "serial"), "registered", now_iso()),
         )
         conn.commit()
     log_event("DEVICE_REGISTERED_MANUAL", device_id, "SUCCESS", f"Manual lab import for {name}")
@@ -474,7 +609,7 @@ def issue_cert(device_id):
         existing = conn.execute("SELECT * FROM certificates WHERE device_id=? AND status='active'", (device_id,)).fetchone()
         if existing:
             return redirect(public_url("/"))
-        serial, subject, issued, expires, cert_pem, key_pem = issue_server_generated_demo_certificate(device)
+        serial, subject, issued, expires, cert_pem, key_pem = issue_server_generated_demo_certificate(decrypt_record(device))
         conn.execute(
             "INSERT INTO certificates(device_id,serial_number,subject,issued_at,expires_at,certificate_pem,private_key_pem,status) VALUES(?,?,?,?,?,?,?,?)",
             (device_id, serial, subject, issued, expires, cert_pem, key_pem, "active"),
@@ -516,15 +651,34 @@ def api_admin_ping():
 @admin_api_required
 def api_admin_dashboard():
     with db() as conn:
-        pending = [dict(r) for r in conn.execute("SELECT * FROM pending_enrollments ORDER BY id DESC").fetchall()]
-        devices = [dict(r) for r in conn.execute("SELECT * FROM devices ORDER BY id DESC").fetchall()]
+        conn.execute("UPDATE sessions SET active=0 WHERE active=1 AND expires_at<=?", (now_iso(),))
+        pending = [decrypt_record(r) for r in conn.execute("SELECT * FROM pending_enrollments WHERE status='pending' ORDER BY id DESC").fetchall()]
+        devices = [decrypt_record(r) for r in conn.execute("SELECT * FROM devices ORDER BY id DESC").fetchall()]
         certs = [dict(r) for r in conn.execute("SELECT * FROM certificates ORDER BY id DESC").fetchall()]
         revoked = [dict(r) for r in conn.execute("SELECT * FROM revoked_certificates ORDER BY id DESC").fetchall()]
-        logs = [dict(r) for r in conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 150").fetchall()]
+        logs = [decrypt_record(r) for r in conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 150").fetchall()]
+        for log in logs:
+            log["incident_time"] = incident_time_display(log.get("event_time"))
         sessions = [dict(r) for r in conn.execute("SELECT * FROM sessions WHERE active=1 AND expires_at>? ORDER BY id DESC", (now_iso(),)).fetchall()]
+        conn.commit()
+    active_devices = {row["device_id"] for row in sessions}
+    latest_certificate = {}
     for c in certs:
         c.pop("private_key_pem", None)
         c["status"] = certificate_status(c)
+        c["public_key_fingerprint"] = public_key_fingerprint_from_certificate(c["certificate_pem"])
+        latest_certificate.setdefault(c["device_id"], c)
+    for device in devices:
+        device_id = device["device_id"]
+        cert = latest_certificate.get(device_id)
+        if device_id in active_devices:
+            device["access_status"] = "HR access active"
+        elif not cert:
+            device["access_status"] = "No certificate issued"
+        elif cert["status"] != "active":
+            device["access_status"] = f"Blocked — certificate {cert['status']}"
+        else:
+            device["access_status"] = "Certificate issued — verification required"
     return jsonify({"pending": pending, "devices": devices, "certificates": certs,
                      "revoked": revoked, "logs": logs, "sessions": sessions})
 
@@ -532,31 +686,16 @@ def api_admin_dashboard():
 @app.post("/api/admin/enrollments/approve/<request_id>")
 @admin_api_required
 def api_admin_approve(request_id):
-    with db() as conn:
-        enr = conn.execute("SELECT * FROM pending_enrollments WHERE request_id=?", (request_id,)).fetchone()
-        if not enr or enr["status"] != "pending":
-            return jsonify({"status": "error", "message": "Request not found or already reviewed"}), 404
-        existing_device = conn.execute("SELECT * FROM devices WHERE device_id=?", (enr["device_id"],)).fetchone()
-        existing_cert = conn.execute("SELECT * FROM certificates WHERE device_id=? AND status='active'", (enr["device_id"],)).fetchone()
-        if not existing_device:
-            conn.execute(
-                "INSERT INTO devices(device_id,device_name,assigned_user,department,serial_number,status,created_at) VALUES(?,?,?,?,?,?,?)",
-                (enr["device_id"], enr["device_name"], enr["assigned_user"], enr["department"], enr["serial_number"], "registered", now_iso()),
-            )
-        else:
-            # Re-enrollment: reset revoked/suspended device back to registered
-            conn.execute("UPDATE devices SET status='registered', device_name=?, assigned_user=?, department=? WHERE device_id=?",
-                         (enr["device_name"], enr["assigned_user"], enr["department"], enr["device_id"]))
-        if not existing_cert:
-            serial, subject, issued, expires, cert_pem = sign_csr_device_certificate(enr, enr["csr_pem"])
-            conn.execute(
-                "INSERT INTO certificates(device_id,serial_number,subject,issued_at,expires_at,certificate_pem,private_key_pem,status) VALUES(?,?,?,?,?,?,?,?)",
-                (enr["device_id"], serial, subject, issued, expires, cert_pem, "", "active"),
-            )
-        conn.execute("UPDATE pending_enrollments SET status='approved', reviewed_at=?, reviewed_by=? WHERE request_id=?", (now_iso(), "it_admin", request_id))
-        conn.commit()
-    log_event("ENROLLMENT_APPROVED", enr["device_id"], "SUCCESS", "CSR signed and device certificate issued via desktop admin app")
-    return jsonify({"status": "approved", "device_id": enr["device_id"]})
+    result = approve_enrollment_request(request_id, "it_admin")
+    if not result:
+        return jsonify({"status": "error", "message": "Request not found or already reviewed"}), 404
+    log_event("ENROLLMENT_APPROVED", result["device_id"], "SUCCESS", f"CSR signed; certificate {result['certificate_serial']} issued via desktop admin app")
+    return jsonify({
+        "status": "approved",
+        "device_id": result["device_id"],
+        "certificate_serial": result["certificate_serial"],
+        "next_step": "Device must fetch the certificate and complete private-key proof before HR access becomes active",
+    })
 
 
 @app.post("/api/admin/enrollments/reject/<request_id>")
@@ -633,11 +772,16 @@ def verify_demo(device_id):
 def create_verified_session(device_id, certificate_serial):
     token = secrets.token_urlsafe(32)
     expires = datetime.now(timezone.utc) + timedelta(hours=1)
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    source_ip = client_ip()
     with db() as conn:
+        # One current trusted browser session per corporate device keeps the
+        # administration console unambiguous and invalidates stale cookies.
+        conn.execute("UPDATE sessions SET active=0 WHERE device_id=? AND active=1", (device_id,))
+        token_hash = secure_storage.token_hash(token)
+        token_encrypted = protect(token, "session_token")
         conn.execute(
-            "INSERT INTO sessions(token,device_id,certificate_serial,created_at,expires_at,active,bound_ip) VALUES(?,?,?,?,?,1,?)",
-            (token, device_id, certificate_serial, now_iso(), expires.replace(microsecond=0).isoformat(), client_ip),
+            "INSERT INTO sessions(token,token_hash,token_encrypted,device_id,certificate_serial,created_at,expires_at,active,bound_ip) VALUES(?,?,?,?,?,?,?,1,?)",
+            (token_hash, token_hash, token_encrypted, device_id, certificate_serial, now_iso(), expires.replace(microsecond=0).isoformat(), source_ip),
         )
         conn.commit()
     return token
@@ -662,23 +806,77 @@ def api_enrollment_request():
         log_event("ENROLLMENT_FAILED", device_id, "DENIED", f"Invalid CSR: {exc}")
         return jsonify({"status": "error", "message": "Invalid CSR"}), 400
     with db() as conn:
-        existing_active = conn.execute("SELECT 1 FROM devices WHERE device_id=? AND status='registered'", (device_id,)).fetchone()
-        if existing_active:
-            return jsonify({"status": "exists", "message": "Device already registered", "device_id": device_id}), 409
-        existing_pending = conn.execute("SELECT * FROM pending_enrollments WHERE device_id=? AND status='pending'", (device_id,)).fetchone()
+        # A device that already owns an active certificate must not create another
+        # enrolment request. Match on the claimed device ID and on the stable
+        # browser hardware identifiers to prevent the same laptop being entered
+        # again under a different device ID.
+        existing_certified = conn.execute(
+            """
+            SELECT c.device_id, c.serial_number AS certificate_serial, c.issued_at,
+                   c.expires_at, d.serial_number AS asset_serial
+            FROM certificates c
+            LEFT JOIN devices d ON d.device_id = c.device_id
+            WHERE c.status='active'
+              AND (
+                    c.device_id=?
+                    OR d.serial_lookup=?
+                    OR EXISTS (
+                        SELECT 1 FROM pending_enrollments p
+                        WHERE p.device_id=c.device_id AND p.mac_lookup=?
+                    )
+                  )
+            ORDER BY c.id DESC
+            LIMIT 1
+            """,
+            (device_id, secure_storage.lookup_hash(data["serial_number"], "serial"), secure_storage.lookup_hash(data["mac_address"], "mac")),
+        ).fetchone()
+        if existing_certified:
+            certified_device_id = existing_certified["device_id"]
+            detail = (
+                f"Duplicate registration blocked. Device already has active certificate "
+                f"{existing_certified['certificate_serial']} as {certified_device_id}"
+            )
+            log_event("DUPLICATE_ENROLLMENT_BLOCKED", certified_device_id, "DENIED", detail)
+            return jsonify({
+                "status": "already_certified",
+                "message": "This device is already registered and has an active certificate. A second registration is not allowed. Use the existing certificate or contact IT if the device must be replaced or recovered.",
+                "device_id": certified_device_id,
+                "certificate_serial": existing_certified["certificate_serial"],
+                "issued_at": existing_certified["issued_at"],
+                "expires_at": existing_certified["expires_at"],
+            }), 409
+
+        existing_pending = conn.execute(
+            "SELECT * FROM pending_enrollments WHERE device_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        if existing_pending and existing_pending["public_key_fingerprint"] == fingerprint:
+            return jsonify({
+                "status": "pending",
+                "message": "This exact key is already awaiting administrator approval",
+                "request_id": existing_pending["request_id"],
+                "device_id": device_id,
+                "public_key_fingerprint": fingerprint,
+            }), 200
         if existing_pending:
-            return jsonify({"status": "pending", "message": "Enrollment already pending", "request_id": existing_pending["request_id"], "device_id": device_id}), 200
+            conn.execute(
+                "UPDATE pending_enrollments SET status='superseded', reviewed_at=?, reviewed_by=?, rejection_reason=? WHERE request_id=?",
+                (now_iso(), "system", "Replaced by a newer CSR from the same device portal", existing_pending["request_id"]),
+            )
         request_id = "ENR-" + secrets.token_hex(5).upper()
+        csr_reference = secure_storage.save_csr(request_id, data["assigned_user"].strip(), csr_pem)
         conn.execute(
-            """INSERT INTO pending_enrollments(request_id,device_id,device_name,assigned_user,department,serial_number,hostname,os_name,mac_address,csr_pem,public_key_fingerprint,status,requested_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (request_id, device_id, data["device_name"].strip(), data["assigned_user"].strip(), data["department"].strip(),
-             data["serial_number"].strip().upper(), data["hostname"].strip(), data["os_name"].strip(), data["mac_address"].strip(),
-             csr_pem, fingerprint, "pending", now_iso()),
+            """INSERT INTO pending_enrollments(request_id,device_id,device_name,assigned_user,department,serial_number,hostname,os_name,mac_address,serial_lookup,mac_lookup,csr_pem,public_key_fingerprint,status,requested_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (request_id, device_id, data["device_name"].strip(), protect(data["assigned_user"].strip(), "assigned_user"), data["department"].strip(),
+             protect(data["serial_number"].strip().upper(), "device_serial"), protect(data["hostname"].strip(), "hostname"), data["os_name"].strip(), protect(data["mac_address"].strip(), "mac_address"),
+             secure_storage.lookup_hash(data["serial_number"], "serial"), secure_storage.lookup_hash(data["mac_address"], "mac"), csr_reference, fingerprint, "pending", now_iso()),
         )
         conn.commit()
-    log_event("ENROLLMENT_REQUESTED", device_id, "PENDING", "Laptop submitted CSR and device metadata for admin approval")
-    return jsonify({"status": "pending", "request_id": request_id, "device_id": device_id, "message": "Enrollment request submitted. Wait for IT admin approval."})
+    log_event("ENROLLMENT_REQUESTED", device_id, "PENDING", "Laptop submitted a CSR and device metadata for administrator approval")
+    message = "Enrollment request submitted. Wait for IT administrator approval."
+    return jsonify({"status": "pending", "request_id": request_id, "device_id": device_id,
+                    "public_key_fingerprint": fingerprint, "message": message})
 
 
 @app.get("/api/enrollment/status/<device_id>")
@@ -686,10 +884,10 @@ def api_enrollment_status(device_id):
     device_id = device_id.upper()
     with db() as conn:
         enr = conn.execute("SELECT * FROM pending_enrollments WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
-        cert = conn.execute("SELECT serial_number, certificate_pem, expires_at, status FROM certificates WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        cert = conn.execute("SELECT serial_number, certificate_pem, expires_at, status FROM certificates WHERE device_id=? AND status='active' ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
     return jsonify({
         "device_id": device_id,
-        "enrollment": dict(enr) if enr else None,
+        "enrollment": decrypt_record(enr) if enr else None,
         "certificate": dict(cert) if cert else None,
     })
 
@@ -698,7 +896,7 @@ def api_enrollment_status(device_id):
 def api_download_certificate(device_id):
     device_id = device_id.upper()
     with db() as conn:
-        cert = conn.execute("SELECT serial_number, certificate_pem, expires_at, status FROM certificates WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        cert = conn.execute("SELECT serial_number, certificate_pem, expires_at, status FROM certificates WHERE device_id=? AND status='active' ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
     if not cert:
         return jsonify({"status": "not_found", "message": "Certificate not issued yet"}), 404
     if certificate_status(cert) != "active":
@@ -714,7 +912,7 @@ def api_auth_challenge():
         return jsonify({"status": "error", "message": "device_id required"}), 400
     with db() as conn:
         device = conn.execute("SELECT * FROM devices WHERE device_id=?", (device_id,)).fetchone()
-        cert = conn.execute("SELECT * FROM certificates WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        cert = conn.execute("SELECT * FROM certificates WHERE device_id=? AND status='active' ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
     if not device or device["status"] != "registered":
         log_event("CHALLENGE_DENIED", device_id or "unknown", "DENIED", "Device not registered")
         return jsonify({"status": "denied", "message": "Device is not registered"}), 403
@@ -739,7 +937,10 @@ def api_auth_verify():
     if not all([device_id, challenge_id, signature_b64, certificate_pem]):
         return jsonify({"status": "error", "message": "device_id, challenge_id, signature and certificate_pem are required"}), 400
     with db() as conn:
-        cert = conn.execute("SELECT * FROM certificates WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        cert = conn.execute(
+            "SELECT * FROM certificates WHERE device_id=? AND status='active' AND certificate_pem=? ORDER BY id DESC LIMIT 1",
+            (device_id, certificate_pem),
+        ).fetchone()
         chal = conn.execute("SELECT * FROM challenges WHERE challenge_id=? AND device_id=? AND used=0", (challenge_id, device_id)).fetchone()
     if not cert or certificate_status(cert) != "active" or not chal:
         log_event("ACCESS_DENIED", device_id, "DENIED", "Invalid certificate status or challenge")
@@ -751,10 +952,6 @@ def api_auth_verify():
             conn.commit()
         log_event("ACCESS_DENIED", device_id, "DENIED", "Authentication challenge expired")
         return jsonify({"status": "denied", "message": "Authentication challenge expired; request a new challenge"}), 403
-    # Require that the presented certificate exactly matches the certificate issued by EndpointTrust.
-    if cert["certificate_pem"].strip() != certificate_pem.strip():
-        log_event("ACCESS_DENIED", device_id, "DENIED", "Presented certificate does not match issued certificate")
-        return jsonify({"status": "denied", "message": "Certificate mismatch"}), 403
     try:
         public_cert = x509.load_pem_x509_certificate(certificate_pem.encode())
         signature = base64.b64decode(signature_b64.encode(), validate=True)
@@ -769,14 +966,24 @@ def api_auth_verify():
         log_event("ACCESS_DENIED", device_id, "DENIED", "Challenge replay or concurrent reuse detected")
         return jsonify({"status": "denied", "message": "Challenge has already been used"}), 403
     token = create_verified_session(device_id, cert["serial_number"])
-    log_event("DEVICE_VERIFIED", device_id, "SUCCESS", "Agent challenge-response authentication successful")
-    return jsonify({"status": "allowed", "device_id": device_id, "session_url": public_url(f"/auth/session/{token}"), "internal_url": "/internal/", "message": "Device verified. Open session_url in browser to set access cookie."})
+    log_event("DEVICE_VERIFIED", device_id, "SUCCESS", "Browser challenge-response authentication successful; HR access session activated")
+    response = jsonify({
+        "status": "allowed",
+        "device_id": device_id,
+        "internal_url": "/internal/",
+        "session_url": public_url(f"/auth/session/{token}"),
+        "message": "Device verified. HR access is active for this browser.",
+    })
+    # Set the trusted-device cookie directly on the successful same-origin API
+    # response. This removes the fragile second redirect/token step.
+    response.set_cookie("endpointtrust_session", token, httponly=True, samesite="Lax", path="/", max_age=3600)
+    return response
 
 
 @app.get("/auth/session/<token>")
 def browser_session(token):
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    row = valid_session(token, client_ip)
+    source_ip = client_ip()
+    row = valid_session(token, source_ip)
     if not row:
         return make_response("Invalid or expired EndpointTrust session token", 403)
     resp = make_response(redirect("/internal/"))
@@ -784,11 +991,27 @@ def browser_session(token):
     return resp
 
 
+@app.get("/api/auth/session-status")
+def api_auth_session_status():
+    token = request.cookies.get("endpointtrust_session")
+    row = valid_session(token, client_ip())
+    if not row:
+        return jsonify({"status": "inactive", "active": False}), 401
+    return jsonify({
+        "status": "active",
+        "active": True,
+        "device_id": row["device_id"],
+        "certificate_serial": row["certificate_serial"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+    })
+
+
 @app.get("/auth/nginx-check")
 def nginx_check():
     token = request.cookies.get("endpointtrust_session")
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    row = valid_session(token, client_ip)
+    source_ip = client_ip()
+    row = valid_session(token, source_ip)
     if not row:
         log_event("NGINX_ACCESS_CHECK", "unknown", "DENIED", "Missing/invalid session, or risk-based re-verification triggered")
         return ("denied", 403)
@@ -808,7 +1031,7 @@ def api_status():
             "devices": conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"],
             "certificates": conn.execute("SELECT COUNT(*) c FROM certificates").fetchone()["c"],
             "revoked": conn.execute("SELECT COUNT(*) c FROM revoked_certificates").fetchone()["c"],
-            "active_sessions": conn.execute("SELECT COUNT(*) c FROM sessions WHERE active=1").fetchone()["c"],
+            "active_sessions": conn.execute("SELECT COUNT(*) c FROM sessions WHERE active=1 AND expires_at>?", (now_iso(),)).fetchone()["c"],
         })
 
 
@@ -817,7 +1040,7 @@ def logout():
     token = request.cookies.get("endpointtrust_session")
     if token:
         with db() as conn:
-            conn.execute("UPDATE sessions SET active=0 WHERE token=?", (token,))
+            conn.execute("UPDATE sessions SET active=0 WHERE token_hash=?", (token_hash,))
             conn.commit()
     resp = make_response(redirect(public_url("/login")))
     resp.delete_cookie("endpointtrust_session", path="/")

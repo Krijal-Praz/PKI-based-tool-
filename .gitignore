@@ -1,23 +1,71 @@
+# --------------------------------------------------
+# Python
+# --------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+.pytest_cache/
+.coverage
+htmlcov/
 
+# Virtual environments
+.venv/
 venv/
-.env
+.admin-venv/
 
+# --------------------------------------------------
+# Environment variables
+# --------------------------------------------------
+.env
+.env.*
+
+# --------------------------------------------------
+# EndpointTrust generated data
+# --------------------------------------------------
+endpointtrust/data/
+endpointtrust/secure_storage/
+
+# Keep folder structure (optional)
+!endpointtrust/secure_storage/
+!endpointtrust/secure_storage/encrypted_csrs/
+!endpointtrust/secure_storage/encrypted_logs/
+!endpointtrust/secure_storage/encrypted_csrs/.gitkeep
+!endpointtrust/secure_storage/encrypted_logs/.gitkeep
+
+# --------------------------------------------------
+# Certificates and private keys
+# --------------------------------------------------
+endpointtrust/certs/ca_key.pem
+*.key
+*.pem
+
+# Keep the public CA certificate if required
+!endpointtrust/certs/ca_cert.pem
+
+# --------------------------------------------------
+# Runtime encryption files
+# --------------------------------------------------
+*.enc
+master.key
+
+# --------------------------------------------------
+# SQLite databases
+# --------------------------------------------------
 *.db
 *.sqlite
 *.sqlite3
 
-certs/private/
-*.key
-*.pem
-
-node_modules/
-
+# --------------------------------------------------
+# IDE / Editor
+# --------------------------------------------------
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
+# --------------------------------------------------
+# Operating System
+# --------------------------------------------------
 .DS_Store
-
-*.log
+Thumbs.db
