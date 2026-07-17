@@ -69,3 +69,17 @@ master.key
 # --------------------------------------------------
 .DS_Store
 Thumbs.db
+
+
+# Ignore secure storage contents
+endpointtrust/secure_storage/*
+endpointtrust/secure_storage/encrypted_csrs/*
+endpointtrust/secure_storage/encrypted_logs/*
+
+# Allow the folders and placeholder files
+!endpointtrust/secure_storage/
+!endpointtrust/secure_storage/encrypted_csrs/
+!endpointtrust/secure_storage/encrypted_logs/
+!endpointtrust/secure_storage/.gitkeep
+!endpointtrust/secure_storage/encrypted_csrs/.gitkeep
+!endpointtrust/secure_storage/encrypted_logs/.gitkeep
