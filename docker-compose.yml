@@ -1,3 +1,5 @@
+name: endpointtrust_pki_v7
+
 services:
   nginx_gateway:
     image: nginx:1.27-alpine
@@ -7,11 +9,14 @@ services:
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - endpointtrust
-      - internal_hr
+      endpointtrust:
+        condition: service_healthy
+      internal_hr:
+        condition: service_healthy
     networks:
       - public_net
       - private_net
+    restart: unless-stopped
 
   endpointtrust:
     build: ./endpointtrust
@@ -20,14 +25,25 @@ services:
       - FLASK_ENV=production
       - ENDPOINTTRUST_DB=/app/data/endpointtrust.db
       - ENDPOINTTRUST_CERT_DIR=/app/certs
-      - ENDPOINTTRUST_REBIND_IP=false
+      - ENDPOINTTRUST_SECURE_STORAGE=/app/secure_storage
+      - ENDPOINTTRUST_REBIND_IP=true
+      - ENDPOINTTRUST_CHALLENGE_TTL=60
+      - ENDPOINTTRUST_SECRET=EndpointTrust-v5-demo-session-secret-change-before-production
     volumes:
       - endpointtrust_data:/app/data
       - endpointtrust_certs:/app/certs
+      - endpointtrust_secure_storage:/app/secure_storage
     expose:
       - "5000"
     networks:
       - private_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/status', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
 
   internal_hr:
     build: ./internal_hr
@@ -36,10 +52,18 @@ services:
       - "5001"
     networks:
       - private_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
 
 volumes:
   endpointtrust_data:
   endpointtrust_certs:
+  endpointtrust_secure_storage:
 
 networks:
   public_net:

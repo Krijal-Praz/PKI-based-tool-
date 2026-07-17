@@ -107,7 +107,7 @@ python scripts/endpointtrust_agent.py verify http://localhost:8080/endpointtrust
 
   <div class="row g-3 mt-1">
     <div class="col-lg-6"><div class="card p-3"><h5>Certificate Revocation Database</h5><table class="table table-sm"><thead><tr><th>Serial</th><th>Device</th><th>Reason</th><th>Time</th></tr></thead><tbody>{% for r in revoked %}<tr><td class="mono">{{ r.certificate_serial[:20] }}...</td><td>{{ r.device_id }}</td><td>{{ r.reason }}</td><td class="mono">{{ r.revoked_at }}</td></tr>{% else %}<tr><td colspan="4" class="text-muted text-center">No revoked certificates.</td></tr>{% endfor %}</tbody></table></div></div>
-    <div class="col-lg-6"><div class="card p-3"><h5>Audit Logs</h5><table class="table table-sm"><thead><tr><th>Time</th><th>Event</th><th>Device</th><th>Status</th></tr></thead><tbody>{% for l in logs %}<tr><td class="mono">{{ l.event_time }}</td><td>{{ l.event_type }}</td><td>{{ l.device_id }}</td><td>{{ l.status }}</td></tr>{% else %}<tr><td colspan="4" class="text-muted text-center">No logs yet.</td></tr>{% endfor %}</tbody></table></div></div>
+    <div class="col-lg-6"><div class="card p-3"><h5>Audit Logs</h5><table class="table table-sm"><thead><tr><th>Incident Time (Nepal)</th><th>Event</th><th>Device</th><th>Status</th></tr></thead><tbody>{% for l in logs %}<tr><td class="mono">{{ l.incident_time }}</td><td>{{ l.event_type }}</td><td>{{ l.device_id }}</td><td>{{ l.status }}</td></tr>{% else %}<tr><td colspan="4" class="text-muted text-center">No logs yet.</td></tr>{% endfor %}</tbody></table></div></div>
   </div>
 </div>
 </body>

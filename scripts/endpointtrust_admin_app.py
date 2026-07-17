@@ -37,7 +37,7 @@ DEVICE_COLUMNS = (
     "serial_number", "expires_at", "certificate_status", "access_status",
 )
 SESSION_COLUMNS = ("device_id", "certificate_serial", "bound_ip", "created_at", "expires_at")
-LOG_COLUMNS = ("event_time", "event_type", "device_id", "status", "detail", "source_ip")
+LOG_COLUMNS = ("incident_time", "event_type", "device_id", "status", "detail", "source_ip")
 
 
 class LoginDialog(simpledialog.Dialog):
@@ -219,7 +219,7 @@ class EndpointTrustAdminApp(tk.Tk):
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
         widths = {
-            "detail": 360, "public_key_fingerprint": 300, "event_time": 185,
+            "detail": 360, "public_key_fingerprint": 300, "incident_time": 205,
             "requested_at": 185, "created_at": 185, "expires_at": 185,
             "certificate_serial": 260, "serial_number": 230, "access_status": 255,
         }
